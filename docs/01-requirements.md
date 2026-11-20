@@ -23,7 +23,7 @@ LLM Agents are everywhere and their usage are starting to grow to scales in whic
 
 ### 3.1 Goals
 
-- **G1:** A tenant developer can open one agent run and see every step (LLM calls, tool calls, retrieval steps) with prompt, completion, tool input/output, model, tokens, latency, cost and errors, within 1 minute of the run happening.
+- **G1:** A tenant developer can open one agent run and see every step (LLM calls, tool calls, retrieval steps) with prompt, completion, tool input/output, model, tokens, latency, cost and errors, within 2 minutes of the run happening.
 - **G2:** Tenants can see token usage and cost per tenant, per model and per day.
 - **G3:** Tenants can find traces by session ID, user ID, time range, model and error status.
 - **G4:** Tenants can attach eval scores and user feedback to a trace or span after it was ingested.
@@ -146,7 +146,7 @@ LLM Agents are everywhere and their usage are starting to grow to scales in whic
 
 | ID | Requirement | Priority | Rationale | Acceptance criteria |
 |---|---|---|---|---|
-| FR-ADM-001 | Create, rotate and revoke API keys; a revoked key stops working within 1 minute | Must | Basic credential hygiene | A revoked key gets 401 within 1 minute |
+| FR-ADM-001 | Create, rotate and revoke API keys; a revoked key stops working within 2 minutes | Must | Basic credential hygiene | A revoked key gets 401 within 2 minutes |
 | FR-ADM-002 | Notify the tenant admin (email and/or webhook) at 80% and at 100% of the daily quota | Must | Warn before the limit so dropping data is never a surprise | Crossing 80% and 100% each triggers exactly one notification per day |
 | FR-ADM-003 | Change a tenant's tier; new limits apply within 5 minutes without a redeploy | Should | Upgrades must take effect quickly | After an upgrade to Pro, the tenant is throttled at Pro limits within 5 minutes |
 
@@ -160,7 +160,7 @@ LLM Agents are everywhere and their usage are starting to grow to scales in whic
 | NFR-PERF-002 | Peak ingest rate per tenant (spans/s) | Normal: 5 MB/s (≈ 33 spans/s at average span size); Pro: 50 MB/s (≈ 330 spans/s) | Gateway per-tenant counters | Limits are in bytes; span count depends on span size (see Q6) |
 | NFR-PERF-003 | Max span payload size (KB) | 1,024 KB per span; 4 MB per request | Gateway request validation | Prompt/completion bodies; see FR-ING-002 |
 | NFR-PERF-004 | Ingest acknowledgement latency (p99, ms) | ≤ 500 ms | Gateway, from request received to response sent | Includes the durable queue write (FR-ING-006) |
-| NFR-PERF-005 | End-to-end freshness: ingest to queryable (p99, s) | ≤ 60 s | Synthetic canary tenant writes a span every 10 s and polls until it is queryable | Under a hot tenant, see NFR-ISO-001 |
+| NFR-PERF-005 | End-to-end freshness: ingest to queryable (p99, s) | ≤ 120 s | Synthetic canary tenant writes a span every 10 s and polls until it is queryable | Under a hot tenant, see NFR-ISO-001 |
 | NFR-PERF-006 | Query latency (p95, s) | Trace by ID ≤ 2 s; search over 14 days ≤ 5 s; cost aggregates ≤ 3 s | Query API server-side timings | Per tenant, at design-point data volume |
 | NFR-PERF-007 | Number of tenants | 5,000 | Load test with 5,000 synthetic tenants at A2/A3 usage | Design point; see NG6 |
 
@@ -260,3 +260,4 @@ LLM Agents are everywhere and their usage are starting to grow to scales in whic
 |---|---|---|
 | 2026-11-20 | Hossam Hosny | Initial skeleton |
 | 2026-11-20 | Hossam Hosny | Filled in goals, non-goals, personas, glossary, requirements, NFRs, capacity estimates and open questions |
+| 2026-11-20 | Hossam Hosny | Changed Freshness target to 2 minutes instead of 1. This is to help reduce the number of files that will be stored in the Storage engine. |

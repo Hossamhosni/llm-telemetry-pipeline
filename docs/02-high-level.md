@@ -2,14 +2,14 @@
 
 | | |
 |---|---|
-| **Status** | Draft (part 1 of 2) |
+| **Status** | Draft (parts 1 and 2; §5–9 assume ClickHouse pending ADR-0001) |
 | **Owner** | Hossam Hosny |
-| **Last updated** | 2026-11-22 |
+| **Last updated** | 2026-11-24 |
 | **Related docs** | [01-requirements.md](01-requirements.md), [03-failure-modes.md](03-failure-modes.md), [adr/](adr/) |
 
 ## 1. Summary
 
-Tenants export OTLP traces to a stateless **gateway**, which authenticates them, enforces size limits, rate limits and daily quotas, samples over-quota traffic, counts tokens and cost, and acknowledges only after a durable write to a **stream**. **Consumer workers** read the stream, group spans by tenant, buffer them for up to 60 s or 2 MB, deduplicate them and write them to **object storage** and the **query store**. A **query API** serves the UI. Postgres holds tenant configuration; Redis holds shared quota counters.
+Tenants export OTLP traces to a stateless **gateway**, which authenticates them, enforces size limits, rate limits and daily quotas, samples over-quota traffic, counts tokens and cost, and acknowledges only after a durable write to a **stream**. **Consumer workers** read the stream, buffer them (≤ 10 s per worker batch with ClickHouse; ≤ 60 s or 2 MB per tenant in the file-based shape), deduplicate them and write them to **object storage** and the **query store**. A **query API** serves the UI. Postgres holds tenant configuration; Redis holds shared quota counters.
 
 ```mermaid
 flowchart LR
@@ -42,7 +42,7 @@ flowchart LR
 | **Quota counter store (Redis)** | Shared per-tenant daily byte counters; gateways sync local counts at least every 10 s (NFR-ISO-004) | Single primary + replica | Counters reset daily |
 | **Tenant config store (Postgres)** | Tenants, API keys, tiers and limits, model price table | Single primary + replica | Source of truth; cached in gateways |
 | **Stream (Kinesis)** | Durable, replayable buffer between ingest and processing; decouples gateway latency from storage latency | Shard (1 MB/s or 1,000 records/s write) | Records kept for the stream retention period |
-| **Consumer workers** | Read shards (KCL leases); group spans by tenant; buffer ≤ 60 s or 2 MB per tenant buffer; dedup by (trace_id, span_id); write files/rows; checkpoint only after flush | Worker (owns a set of shards) | In-memory buffers; checkpoints in KCL's lease table |
+| **Consumer workers** | Read shards (KCL leases); buffer ≤ 10 s as one batch across tenants (ClickHouse) or ≤ 60 s / 2 MB per tenant (file-based); dedup by (trace_id, span_id); write files/rows; checkpoint only after flush | Worker (owns a set of shards) | In-memory buffers; checkpoints in KCL's lease table |
 | **Object storage (S3)** | Trace data files partitioned by tenant; large payloads (see ADR-0002); short-lived raw copy for replay | Prefix | 14-day lifecycle on trace data; 3 days on raw |
 | **Compaction job** *(file-based shape only)* | Merge small files into large ones, dedup during merge, swap atomically (table-format commit) | Job per partition | None beyond the table metadata |
 | **Query store** | Serve trace lookup, search by session/user/model/error/score, and cost aggregates | Depends on ADR-0001 | 14-day TTL on traces; longer on aggregates (Q2) |
@@ -84,7 +84,7 @@ Target: p99 ≤ 120 s from ack to queryable (NFR-PERF-005).
 |---|---|---|
 | Gateway → stream write | in the ack path | Not counted: freshness starts at the ack |
 | Stream put → worker read | ≤ 2 s | KCL polling; less with enhanced fan-out |
-| Worker buffer | ≤ 60 s | Max buffer age; flush earlier at 2 MB |
+| Worker buffer | ≤ 60 s | Max buffer age; flush earlier at 2 MB. With ClickHouse this drops to ≤ 10 s (§5) |
 | Write to S3 / insert into query store | ≤ 5 s | |
 | Query store visibility | ≤ 30 s | Table-format commit interval, or immediate for an OLAP insert (ADR-0001) |
 | Headroom | ≈ 23 s | Retries, GC pauses, short lag spikes |
@@ -94,23 +94,184 @@ Target: p99 ≤ 120 s from ack to queryable (NFR-PERF-005).
 
 ## 5. Data flows
 
-*Part 2 (ST-22): write path, read path, late-score path, as sequence diagrams.*
+> Sections 5–9 assume **ClickHouse** as the query store (the likely outcome of ADR-0001). If ADR-0001 picks the file-based shape, sections 5.1 and 6 change; the API contract (7) does not.
+
+With ClickHouse, workers no longer keep one buffer per tenant. Each worker keeps **one buffer containing all tenants' spans** and flushes it as a single insert every ~5–10 s (or at a size cap). That is ~17 workers × one insert per 5 s ≈ 3–4 inserts/s for the whole cluster, which is the batch-insert pattern ClickHouse expects, and it removes the per-tenant small-files problem from §3. Tenant separation moves into the table's sort key (§6). Freshness improves too: the buffer stage drops from ≤ 60 s to ≤ 10 s.
+
+### 5.1 Write path
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Tenant exporter
+    participant G as Gateway
+    participant R as Redis
+    participant K as Kinesis
+    participant W as Worker (KCL)
+    participant S3 as S3
+    participant CH as ClickHouse
+    participant L as KCL lease table
+    C->>G: POST /v1/traces (x-api-key, ≤ 4 MB)
+    G->>G: API key → tenant (cached from Postgres), size check, token bucket
+    break invalid key, request > 4 MB, or over rate limit
+        G-->>C: 401 / 413 / 429 + Retry-After
+    end
+    G->>G: daily quota check (local counter)
+    Note over G: over quota → keep span only if hash(trace_id) mod 10 == 0
+    G->>G: count tokens and cost for ALL received spans → usage record
+    G->>G: truncate fields so no span > 1 MB
+    G->>K: PutRecords: kept spans + usage record (partition key per ADR-0003)
+    K-->>G: per-record results
+    opt some records failed
+        G->>K: retry only the failed records
+    end
+    alt all kept records written
+        G-->>C: 200 (partial_success.rejected_spans = sampled-out count)
+    else retries exhausted
+        G-->>C: 503 + Retry-After (exporter resends the whole request)
+    end
+    G-)R: INCRBY tenant bytes (background, every ≤ 10 s)
+    R--)G: tenant's global total → refresh local counter
+    W->>K: GetRecords
+    K-->>W: records
+    W->>W: buffer ≤ 10 s, dedup by (trace_id, span_id) within the batch
+    W->>S3: PUT raw batch (3-day lifecycle) + large payloads (ADR-0002)
+    W->>CH: INSERT batch into spans and usage (all tenants, one insert each)
+    W->>L: checkpoint, only after S3 and ClickHouse both succeed
+```
+
+Key points:
+- **The ack waits for Kinesis.** Success is returned only after every kept record is in the stream (FR-ING-006). If retries of failed records run out, the gateway returns 503 + Retry-After for the whole request and the exporter retries it. Duplicates from that retry are absorbed by dedup (§6, ADR-0004).
+- **Cost counting happens before sampling.** The gateway sends a small usage record (tenant, model, tokens, cost, spans received, spans kept) for every request, so cost reports include sampled-out traffic (FR-PRC-002, NFR-CST-001).
+- **Checkpointing after the write** means a worker crash replays at most one buffer (≤ 10 s) of records. That is at-least-once delivery; dedup handles the replays.
+
+### 5.2 Read path
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant U as UI
+    participant Q as Query API
+    participant CH as ClickHouse
+    participant S3 as S3
+    U->>Q: GET /api/traces?session_id=…&from=…&to=…
+    Q->>Q: tenant from the user's session (never from the request)
+    Q->>CH: SELECT … FROM traces WHERE tenant_id = ? AND session_id = ? AND start_time BETWEEN ? AND ?
+    CH-->>Q: trace summaries
+    Q-->>U: list (trace_id, start_time, tokens, cost, status, score)
+    U->>Q: GET /api/traces/{trace_id}?start_time=…
+    Q->>CH: SELECT … FROM spans WHERE tenant_id = ? AND trace_id = ? AND start_time BETWEEN ? ± 1 h
+    Q->>CH: SELECT … FROM scores WHERE tenant_id = ? AND trace_id = ?
+    Q-->>U: span tree + scores (no payloads yet)
+    U->>Q: GET /api/spans/{span_id}/payload (user clicks a span)
+    Q->>S3: GET payload by reference (or read the payload column, ADR-0002)
+    Q-->>U: prompt, completion, tool input/output
+```
+
+- **Payloads are loaded lazily.** Opening a trace returns metadata only; a span's prompt and completion load when the user clicks it. Search and cost queries never read payloads.
+- **Trace lookup passes a time hint.** The `spans` sort key starts with `(tenant_id, start_time, …)`, so a lookup by trace_id alone would scan the tenant's whole 14 days. The UI already knows the trace's start time from the list, so the API passes it. A bloom-filter skip index on trace_id covers direct links that arrive without one.
+
+### 5.3 Late-score path
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant T as Tenant (SDK, eval job, UI)
+    participant SA as Scores API
+    participant CH as ClickHouse
+    T->>SA: POST /api/scores {score_id, trace_id, name, value}
+    SA->>SA: tenant from API key
+    SA->>CH: does trace_id exist for this tenant? (traces table)
+    alt not found or expired
+        SA-->>T: 404
+    else found
+        SA->>CH: INSERT INTO scores
+        SA-->>T: 201 (or 200 if score_id was already stored)
+    end
+```
+
+Scores live in their own table and are joined to traces when read, so attaching one never rewrites span data (FR-ING-007). The client-supplied `score_id` makes retries idempotent.
 
 ## 6. Data model
 
-*Part 2: span and trace records, metadata vs payload, trace-level index for session.id and user.id.*
+All tables lead their sort key with `tenant_id`, so every tenant's rows are stored together and every query filters on it first.
+
+| Table | Engine | Sort key (`ORDER BY`) | Partition / TTL | Purpose |
+|---|---|---|---|---|
+| `spans` | ReplacingMergeTree | `(tenant_id, start_time, trace_id, span_id)` | `PARTITION BY toDate(received_at)`, TTL `received_at + 14 days` | One row per span; duplicates collapse during merges |
+| `traces` | AggregatingMergeTree, fed by a materialized view on `spans` | `(tenant_id, trace_id)` | TTL `max_received_at + 14 days` | One summary row per trace, built incrementally as spans arrive in any order |
+| `scores` | ReplacingMergeTree | `(tenant_id, trace_id, score_id)` | TTL `created_at + 14 days` | Eval scores and feedback |
+| `usage` | SummingMergeTree | `(tenant_id, day, model)` | TTL per Q2 (e.g. 13 months) | Tokens, cost, spans received and kept, including sampled-out traffic |
+
+Postgres holds `tenants`, `api_keys` (stored hashed), `tiers` and `model_prices`.
+
+**`spans` columns:** tenant_id, trace_id, span_id, parent_span_id, name, kind (agent / llm / tool / retrieval / other), start_time, end_time, duration_ms, received_at, provider, model, input_tokens, output_tokens, cost_usd, status, error_type, session_id, user_id, sample_rate, truncated, payload_ref (or compressed input/output columns, ADR-0002), attributes (map).
+
+**`traces` columns:** tenant_id, trace_id, start_time (min), end_time (max), root_name, session_id, user_id (taken from the root span when it arrives), span_count, input_tokens, output_tokens, cost_usd (sums), has_error (max), sample_rate, max_received_at.
+
+Design choices worth defending:
+- **TTL and partitions use `received_at`, not `start_time`.** `start_time` comes from the client's clock. A skewed clock would make a span expire early or live forever (DDIA Ch. 8, "Unreliable Clocks"). The server's receive time is the one clock we control.
+- **`traces` is keyed by `(tenant_id, trace_id)` without time.** Its key must be the same for every span of a trace, and the trace's start time isn't known until the root span arrives. Listing a tenant's traces by time scans that tenant's rows, which is cheap: even a Pro tenant at its full 50 GB/day quota has about 50 GB ÷ 3.23 MB ≈ 15.5k traces/day, so ≈ 217k rows over 14 days.
+- **Dedup gap.** ReplacingMergeTree removes duplicates only when parts merge, at an unknown time, so queries can briefly see duplicates. Worse, the `traces` materialized view sums every inserted row, so a replayed span inflates that trace's tokens and cost. Mitigations: dedup in the worker before insert (covers replays within a batch), and an idempotent design for the summary. Decided in ADR-0004.
 
 ## 7. API contract
 
-*Part 2: ingest responses (success, partial success, 401, 413, 429 + Retry-After), query API, scores API.*
+### 7.1 Ingest (OTLP)
+
+`POST /v1/traces` (OTLP/HTTP, protobuf) and `opentelemetry.proto.collector.trace.v1.TraceService/Export` (OTLP/gRPC). Auth header: `x-api-key`.
+
+| Situation | HTTP | gRPC | Client behaviour |
+|---|---|---|---|
+| All spans accepted | 200 | OK | Done |
+| Some spans sampled out (over quota) | 200 + `partial_success` (`rejected_spans`, `error_message`) | OK + `partial_success` | Doesn't retry; logs a warning |
+| Malformed request | 400 | INVALID_ARGUMENT | Doesn't retry |
+| Missing or invalid API key | 401 | UNAUTHENTICATED | Doesn't retry |
+| Request > 4 MB | 413 | RESOURCE_EXHAUSTED, no RetryInfo | Doesn't retry; send smaller batches |
+| Over rate limit | 429 + `Retry-After` | RESOURCE_EXHAUSTED + RetryInfo | Retries after the delay |
+| Stream unavailable or gateway overloaded | 503 + `Retry-After` | UNAVAILABLE + RetryInfo | Retries with backoff |
+
+### 7.2 Query API (UI)
+
+| Endpoint | Returns |
+|---|---|
+| `GET /api/traces?from&to&session_id&user_id&model&status&min_score` | Trace summaries, newest first, paginated |
+| `GET /api/traces/{trace_id}?start_time` | Span tree with metadata and scores, no payloads |
+| `GET /api/spans/{span_id}/payload` | Prompt, completion, tool input/output |
+| `GET /api/usage?from&to&group_by=model\|day` | Tokens, cost, spans received and kept |
+| `GET /api/quota` | Today's bytes used, quota, current sampling state |
+
+### 7.3 Scores API
+
+`POST /api/scores` with `{score_id, trace_id, span_id?, name, value, source}`. Returns 201 when created, 200 when that `score_id` already exists (idempotent), 404 when the trace is unknown or expired.
 
 ## 8. Tenancy across layers
 
-*Part 2: how isolation holds at the gateway, stream, workers, storage and query.*
+| Layer | How tenants are separated | What stops a hot tenant |
+|---|---|---|
+| Gateway | Tenant comes only from the API key | Rate limit (429) and over-quota sampling, before anything reaches shared resources |
+| Kinesis | Shared stream | Gateway limits cap each tenant's share; partition key spreads hot tenants (ADR-0003) |
+| Workers | Shared; one batch holds many tenants | Bounded by the gateway limits upstream |
+| ClickHouse | `tenant_id` leads every sort key; the query API adds `tenant_id = ?` to every query; row policies as a second line of defence | Per-tenant query limits in the query API (e.g. max time range, timeouts) |
+| S3 | Tenant prefix for payloads and raw batches | — |
 
 ## 9. Traceability
 
-*Part 2: NFR ID → design element that satisfies it.*
+| Requirement | Met by |
+|---|---|
+| FR-ING-001 (OTLP over gRPC and HTTP) | §7.1 |
+| FR-ING-003, FR-ING-004 (rate limit, over-quota sampling) | Gateway, §5.1 |
+| FR-ING-005 (partial success) | §7.1 |
+| FR-ING-006 (ack after durable write) | §5.1 |
+| FR-ING-007 (late scores) | §5.3, `scores` table |
+| FR-PRC-002, NFR-CST-001 (cost includes sampled-out traffic) | Usage record from the gateway, `usage` table |
+| FR-PRC-003 (out-of-order spans) | `traces` built incrementally by AggregatingMergeTree |
+| FR-PRC-004 (dedup) | Worker batch dedup + ReplacingMergeTree; gap noted in §6, ADR-0004 |
+| FR-QRY-001, FR-QRY-002 | §5.2, `spans` and `traces` sort keys |
+| FR-STO-001 (14-day retention) | TTL on `received_at`, daily partitions |
+| FR-TEN-001, NFR-SEC-001 | §8 |
+| NFR-PERF-005 (freshness ≤ 2 min) | §4 budget; buffer ≤ 10 s with ClickHouse |
+| NFR-ISO-001, NFR-ISO-002 | Gateway limits, ADR-0003 |
+| NFR-AVL-002 (no loss after ack) | Ack after Kinesis write; checkpoint after storage write |
 
 ## 10. Open design questions
 
@@ -130,3 +291,4 @@ Target: p99 ≤ 120 s from ack to queryable (NFR-PERF-005).
 |---|---|---|
 | 2026-11-22 | Hossam Hosny | Part 1: summary, components, infrastructure sizing, freshness budget, open questions |
 | 2026-11-22 | Hossam Hosny | Rate limit at gateway or load balancer; daily quota in Redis; raw copy kept 3 days |
+| 2026-11-24 | Hossam Hosny | Part 2: data flows, data model, API contract, tenancy, traceability (assuming ClickHouse) |

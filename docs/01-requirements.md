@@ -12,12 +12,12 @@
 
 <!-- One paragraph: what this document defines and which system boundary it covers. -->
 
-This document covers the requirements decision for the project including system boundaries, limitations, expectations and contracts.
+An LLM Pipeline for processing LLM Traces from Agents and LLM applications, with the aim of providing LLM developers with insights and analysis of their agent runs including model usage, token usage using a Query API and UI. Developers bring their own instrumentation so they don't have to integrate a new client SDK.
 
 ## 2. Problem statement
 
 <!-- What hurts today without this pipeline? Who feels it? Why do existing tools fall short for LLM/agent traces? -->
-LLM Agents are everywhere and their usage are starting to grow to scales in which they would need telemetry to be able to reliably debug a conversation gone wrong or where it failed. This system helps developers and users debug their agents (where they failed, how much tokens they used in a particular conversation and what was the usage about)
+An LLM developer teams running an Agent in Production don't have tools tailored for debugging and analyzing agent runs as they are long, branching and expensive and tools typically used for observability like Datadog are not built for this. Agents are also have specific requirements such as their repeated history, costs that depend on model, and scores that could arrive days later. 
 
 ## 3. Goals and non-goals
 
@@ -72,7 +72,7 @@ LLM Agents are everywhere and their usage are starting to grow to scales in whic
 
 ### 6.1 Assumptions
 
-- **A1:** We assume Tenants count to not exceed 5K tenants
+- **A1:** We assume Tenants count to not exceed 5K tenants which should come to 47M spans/day.
 - **A2:** Average usage is 20% of quota
 - **A3:** Peak factor is 4x of Average use
 - **A4:** About 5% of tenants (250) are on the Pro tier. *(Validate: product/market assumption.)*
@@ -121,9 +121,10 @@ LLM Agents are everywhere and their usage are starting to grow to scales in whic
 
 | ID | Requirement | Priority | Rationale | Acceptance criteria |
 |---|---|---|---|---|
-| FR-STO-001 | Data is retained for 14 days and deleted afterwards | Must | Bounds storage (≈ 101 TB raw, see §9); expiry also covers most erasure needs | No span older than 14 days (+ 24 h deletion lag) is returned by any query or remains in storage |
+| FR-STO-001 | Data is retained for 14 days and deleted afterwards | Must | Bounds storage (≈ 101 TB raw, see §9); expiry also covers most erasure needs | No span older than 14 days (+ 24 h deletion lag) is returned by any query or remains in storage and expiry uses server receive time |
 | FR-STO-002 | Keep token and cost aggregates longer than raw traces (duration: Q2) | Should | Monthly cost reporting needs more than 14 days | Cost per tenant/model is queryable for periods older than 14 days |
 | FR-STO-003 | Store payloads as received, encrypted at rest | Must | Tenant-side redaction (NG2); payloads must be treated as sensitive | Stored payloads are byte-identical to what was sent (apart from FR-ING-002 truncation); storage encryption is verified |
+| FR-STO-004 | Keep the raw S3 copy for 3 days| Should | Keep for 3 days to be able to reference the raw data in case we have to do a debug on the data | Data is kept in S3 for 3 days and deleted using a lifecycle policy |
 
 ### 7.4 Query and retrieval
 
@@ -245,13 +246,13 @@ LLM Agents are everywhere and their usage are starting to grow to scales in whic
 | Q1 | What are p99 run length and the compaction threshold? These set the p99 trace size. | Hossam | Open | |
 | Q2 | How long are token/cost aggregates retained (FR-STO-002)? | Hossam | Open | |
 | Q3 | What happens when a Pro tenant exceeds its daily quota: the same sampling as Normal, or billed overage? | Hossam | Open | |
-| Q4 | Quota day boundary: UTC for everyone, or the tenant's time zone? How do we avoid a synchronised reset at midnight UTC? | Hossam | Open | |
-| Q5 | How many tenants at full rate limit at the same time must the gateway absorb (worst case ≈ 36 GB/s)? This sets gateway sizing. | Hossam | Open | |
-| Q6 | Do we need a per-tenant span-count limit in addition to bytes, to stop floods of tiny spans? | Hossam | Open | |
-| Q7 | Is 14-day expiry enough for erasure requests, or do we need a delete-by-user-ID API? | Hossam | Open | |
+| Q4 | Quota day boundary: UTC for everyone, or the tenant's time zone? How do we avoid a synchronised reset at midnight UTC? | Hossam | Closed | We will use one System clock set at UTC time. It is the simpler approach and for tenant teams it will only mean that their quota is reset at a specific hour of the day e.g. For Cairo the quota will be set at 2 AM |
+| Q5 | How many tenants at full rate limit at the same time must the gateway absorb (worst case ≈ 36 GB/s)? This sets gateway sizing. | Hossam | Closed | Planned peak plus 3 Pro tenants and 20 Normal tenants at full rate at once |
+| Q6 | Do we need a per-tenant span-count limit in addition to bytes, to stop floods of tiny spans? | Hossam | Closed | Go with 1000 spans/s for Normal tier and 10,000 for Pro |
+| Q7 | Is 14-day expiry enough for erasure requests, or do we need a delete-by-user-ID API? | Hossam | Closed | We need to include a delete-by-used-id API to have the option to delete a very active user's traces and spans if we need to and also to have the option to delete a user's data if they request their usage to not be tracked |
 | Q8 | What is the infrastructure cost target per ingested GB? | Hossam | Open | |
-| Q9 | Traces that straddle the quota threshold: keep them whole, or accept partial traces? | Hossam | Open | |
-| Q10 | How late can a span arrive and still join its trace (FR-PRC-003)? Up to the 14-day retention, or a shorter window? | Hossam | Open | |
+| Q9 | Traces that straddle the quota threshold: keep them whole, or accept partial traces? | Hossam | Closed | Accept partial traces, and flag them |
+| Q10 | How late can a span arrive and still join its trace (FR-PRC-003)? Up to the 14-day retention, or a shorter window? | Hossam | Closed | Accept spans with start_time from 3 days ago up to 1 hour in the future; reject anything else with partial success|
 | Q11 | Do we store repeated history once (by content hash or delta) to cut the ~83% duplicate bytes? Does quota then count unique or raw bytes? | Hossam | Open | To be decided in the large-payload ADR |
 
 ## 12. Change history
@@ -261,3 +262,4 @@ LLM Agents are everywhere and their usage are starting to grow to scales in whic
 | 2026-11-20 | Hossam Hosny | Initial skeleton |
 | 2026-11-20 | Hossam Hosny | Filled in goals, non-goals, personas, glossary, requirements, NFRs, capacity estimates and open questions |
 | 2026-11-20 | Hossam Hosny | Changed Freshness target to 2 minutes instead of 1. This is to help reduce the number of files that will be stored in the Storage engine. |
+| 2026-11-26 | Hossam Hosny | Closed Q4, Q5, Q6, Q9, and Q10 and added FR-STO-004. |
